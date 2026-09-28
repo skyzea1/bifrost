@@ -578,6 +578,8 @@ func TestWarpLogsLinkPerFilterArgument(t *testing.T) {
 		"session_id":            {arg: "sess-1", want: "sess-1"},
 		"request_id":            {arg: "req-1", want: "req-1"},
 		"parent_request_id":     {arg: "req-0", want: "req-0"},
+		"agent_names":           {arg: []any{"support-bot", "triage-bot"}, want: "support-bot,triage-bot"},
+		"agent_correlation_id":  {arg: "corr-1", want: "corr-1"},
 		"missing_cost_only":     {arg: true, want: "true"},
 		"content_search":        {arg: "payment declined, 50% off", want: "payment declined, 50% off"},
 		"error_types":           {arg: []any{"overloaded_error"}, noLink: true},
