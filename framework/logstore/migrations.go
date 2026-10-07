@@ -359,6 +359,7 @@ var logstoreMigrationSteps = []migrationStep{
 	{IDs: []string{"logs_add_live_session_column"}, run: migrationAddLiveSessionColumn},
 	{IDs: []string{"agent_logs_init"}, run: migrationCreateAgentLogsTable},
 	{IDs: []string{"agent_logs_add_raw_payload_columns"}, run: migrationAddAgentRawPayloadColumns},
+	{IDs: []string{"logs_add_warp_topic_tables"}, run: migrationAddWarpTopicTables},
 }
 
 // areThereAnyPendingMigrations returns true if there are any pending migrations to be applied.
@@ -5320,6 +5321,34 @@ func migrationAddWarpConversationTables(ctx context.Context, db *gorm.DB, logger
 		},
 		Rollback: func(tx *gorm.DB) error {
 			return rollbackWarpConversationTables(tx.WithContext(ctx))
+		},
+	}})
+	if err := m.Migrate(); err != nil {
+		return fmt.Errorf("error running %s migration: %s", migrationName, err.Error())
+	}
+	return nil
+}
+
+// migrationAddWarpTopicTables creates the storage for Warp's topics: the
+// topics, one assignment row per request, and the pool of requests that
+// matched no topic. See warptopics.go.
+func migrationAddWarpTopicTables(ctx context.Context, db *gorm.DB, logger schemas.Logger) error {
+	migrationName := "logs_add_warp_topic_tables"
+	logger.Info("[logstore] starting migration %s", migrationName)
+	defer logger.Info("[logstore] finished migration %s", migrationName)
+	// Transactional so a boot that dies part-way leaves none of the three. No
+	// boundDDLLockWait: this only creates tables that do not exist yet.
+	opts := *migrator.DefaultOptions
+	opts.UseTransaction = true
+	m := migrator.New(db, &opts, []*migrator.Migration{{
+		ID: migrationName,
+		Migrate: func(tx *gorm.DB) error {
+			return tx.WithContext(ctx).AutoMigrate(&WarpTopic{}, &WarpTopicAssignment{}, &WarpTopicUnmatched{})
+		},
+		// A plain drop, unlike the conversation tables' guarded one: everything
+		// here is derived from the logs and their vectors and can be rebuilt.
+		Rollback: func(tx *gorm.DB) error {
+			return tx.WithContext(ctx).Migrator().DropTable(&WarpTopicUnmatched{}, &WarpTopicAssignment{}, &WarpTopic{})
 		},
 	}})
 	if err := m.Migrate(); err != nil {
