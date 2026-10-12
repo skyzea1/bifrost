@@ -77,6 +77,16 @@ type topicSample struct {
 	vector []float32
 }
 
+// topicMember is one request's place in a cluster: which request, and how
+// like the centre of the cluster k-means put it in it was. The similarity is
+// measured then, against that centre, because the vector is let go of after
+// clustering and the centre a merge settles on comes too late to measure
+// against.
+type topicMember struct {
+	logID      string
+	similarity float32
+}
+
 // topicCluster is a cluster as the run keeps it.
 type topicCluster struct {
 	// sum is the sum of the members' unit vectors, and size how many there
@@ -86,8 +96,17 @@ type topicCluster struct {
 	// samples are the members nearest the centre, nearest first.
 	samples   []topicSample
 	sampleIDs []string
-	label     string
+	// members is every request in the cluster, which is what lets each one
+	// be written down against the topic it ended up in.
+	members []topicMember
+	label   string
 }
+
+// topicsMaxPooled bounds how many requests that matched no topic a run keeps
+// the vectors of for the next discovery. Vectors are the one thing here that
+// is not small, and a run that found no topic for a great many requests is
+// one whose topics are wrong, not one whose pool needs to be complete.
+const topicsMaxPooled = 5000
 
 // centroid is the cluster's centre: the direction of the sum.
 func (c *topicCluster) centroid() []float32 {
@@ -115,6 +134,7 @@ func (c *topicCluster) absorb(other topicCluster) {
 		c.sum[d] += value
 	}
 	c.size += other.size
+	c.members = append(c.members, other.members...)
 	c.setSamples(append(c.samples, other.samples...))
 }
 
@@ -166,10 +186,13 @@ func summarizeClusters(vectors []topicVector, assignments []int, centroids [][]f
 			// Its centroid is left over from seeding and stands for nothing.
 			continue
 		}
-		if observe != nil {
-			centre := clusters[cluster].centroid()
-			for _, member := range members[cluster] {
-				observe(dot(member.vector, centre))
+		centre := clusters[cluster].centroid()
+		clusters[cluster].members = make([]topicMember, 0, len(members[cluster]))
+		for _, member := range members[cluster] {
+			similarity := dot(member.vector, centre)
+			clusters[cluster].members = append(clusters[cluster].members, topicMember{logID: member.logID, similarity: similarity})
+			if observe != nil {
+				observe(similarity)
 			}
 		}
 		clusters[cluster].setSamples(members[cluster])
@@ -333,6 +356,9 @@ type topicRun struct {
 	unmatched int
 	folded    int
 	threshold *float64
+	// pooled are the requests that ended in no topic, with their vectors, up
+	// to topicsMaxPooled of them: what the next discovery starts from.
+	pooled []topicVector
 }
 
 func newTopicRun(limits topicLimits, seed int64) *topicRun {
@@ -487,6 +513,11 @@ func (r *topicRun) settleSmallClusters() {
 			topics = append(topics, cluster)
 		default:
 			r.dropped += cluster.size
+			// A cluster this small is no larger than its samples, so every
+			// member's vector is still here to keep.
+			for _, sample := range cluster.samples {
+				r.pool(topicVector{logID: sample.logID, vector: sample.vector})
+			}
 		}
 	}
 	r.clusters = topics
@@ -550,13 +581,23 @@ func (r *topicRun) assign(entry topicVector) {
 	}
 	if best < 0 || bestScore < r.floor {
 		r.unmatched++
+		r.pool(entry)
 		return
 	}
 	for d, value := range entry.vector {
 		r.clusters[best].sum[d] += value
 	}
 	r.clusters[best].size++
+	r.clusters[best].members = append(r.clusters[best].members, topicMember{logID: entry.logID, similarity: bestScore})
 	r.assigned++
+}
+
+// pool keeps a request that matched no topic, vector and all, while there is
+// room.
+func (r *topicRun) pool(entry topicVector) {
+	if len(r.pooled) < topicsMaxPooled {
+		r.pooled = append(r.pooled, entry)
+	}
 }
 
 // read is how many requests the run has taken in.

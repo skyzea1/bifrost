@@ -375,7 +375,7 @@ func TestWarpTopicsJobReportsClusteredAndAssigned(t *testing.T) {
 			vectors, logs := topicWindowTestStore(t, start, 400)
 			vectors.filtersOnServer = filtersOnServer
 			service := NewService(nil,
-				WithConfigStore(&recordingStore{row: validWarpConfigRow()}), WithLogReader(&semanticLogReader{logs: logs}),
+				WithConfigStore(&recordingStore{row: validWarpConfigRow()}), WithLogReader(topicTestReader(t, logs)),
 				WithVectorStore(vectors), WithEmbeddingExecutor(backfillEmbeddingExecutor), WithChatFunc(topicTestNaming),
 			)
 			defer service.Shutdown()
@@ -410,7 +410,7 @@ func TestWarpTopicsJobReportsClusteredAndAssigned(t *testing.T) {
 			}
 			require.Equal(t, 400, inTopics+final.Unassigned)
 
-			topics, total, err := NewTopicReader(&recordingStore{row: validWarpConfigRow()}, vectors).ListTopics(context.Background(), 15)
+			topics, total, err := NewTopicReader(&recordingStore{row: validWarpConfigRow()}, service.topicStore()).ListTopics(context.Background(), 15)
 			require.NoError(t, err)
 			require.Equal(t, 400, total, "shares are of everything the run read")
 			require.Len(t, topics, 2)
@@ -432,7 +432,7 @@ func TestWarpTopicsJobStopsAtItsReadLimit(t *testing.T) {
 			vectors, logs := topicWindowTestStore(t, start, 400)
 			vectors.filtersOnServer = filtersOnServer
 			service := NewService(nil,
-				WithConfigStore(&recordingStore{row: validWarpConfigRow()}), WithLogReader(&semanticLogReader{logs: logs}),
+				WithConfigStore(&recordingStore{row: validWarpConfigRow()}), WithLogReader(topicTestReader(t, logs)),
 				WithVectorStore(vectors), WithEmbeddingExecutor(backfillEmbeddingExecutor), WithChatFunc(topicTestNaming),
 			)
 			defer service.Shutdown()
@@ -456,7 +456,7 @@ func TestWarpTopicsJobStopsAtItsReadLimit(t *testing.T) {
 	t.Run("a window within the bound is read whole and says nothing of it", func(t *testing.T) {
 		vectors, logs := topicWindowTestStore(t, start, 100)
 		service := NewService(nil,
-			WithConfigStore(&recordingStore{row: validWarpConfigRow()}), WithLogReader(&semanticLogReader{logs: logs}),
+			WithConfigStore(&recordingStore{row: validWarpConfigRow()}), WithLogReader(topicTestReader(t, logs)),
 			WithVectorStore(vectors), WithEmbeddingExecutor(backfillEmbeddingExecutor), WithChatFunc(topicTestNaming),
 		)
 		defer service.Shutdown()

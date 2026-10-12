@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -144,176 +145,10 @@ func topicTestVectors() map[string][]float32 {
 	}
 }
 
-// The job reads the log vectors, clusters them, labels each cluster through
-// the model, and writes one centroid per topic beside the log namespace.
-func TestWarpTopicsJobClustersLabelsAndStores(t *testing.T) {
-	start := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
-	vectors := newFakeWarpVectorStore()
-	logs := topicTestLogs(start)
-	for id, vector := range topicTestVectors() {
-		entry := logs[id]
-		require.NoError(t, vectors.Add(context.Background(), schemas.WarpDefaultLogVectorStoreNamespace, id, vector, map[string]interface{}{
-			"log_id": id, "timestamp": entry.Timestamp.Unix(), "warp_log": true,
-		}))
-	}
-	var labels atomic.Int32
-	model := &scriptedModel{}
-	chat := func(ctx context.Context, req *schemas.BifrostResponsesRequest) (*schemas.BifrostResponsesResponse, *schemas.BifrostError) {
-		labels.Add(1)
-		require.Nil(t, req.Params.Tools, "labelling is a plain completion, no tools")
-		text := responsesInputText(req.Input)
-		if contains(text, "refund") {
-			return TextTurn("Refund requests"), nil
-		}
-		return TextTurn("Password resets"), nil
-	}
-	_ = model
-	service := NewService(nil,
-		WithConfigStore(&recordingStore{row: validWarpConfigRow()}), WithLogReader(&semanticLogReader{logs: logs}),
-		WithVectorStore(vectors), WithEmbeddingExecutor(backfillEmbeddingExecutor), WithChatFunc(chat),
-	)
-	defer service.Shutdown()
-
-	metaJSON, err := service.BuildTopicsJobMeta(context.Background(), start, start.Add(24*time.Hour))
-	require.NoError(t, err)
-	finalJSON, err := service.RunTopicsJob(context.Background(), tables.TableSidekiqJob{ID: "job-1", Metadata: metaJSON}, func(string) error { return nil })
-	require.NoError(t, err)
-
-	var final BackfillJobMeta
-	require.NoError(t, sonic.Unmarshal([]byte(finalJSON), &final))
-	require.Equal(t, 6, final.Scanned, "every vector in the window is read")
-	require.Equal(t, 2, final.Indexed, "one topic per cluster")
-	require.Zero(t, final.Failed)
-	require.EqualValues(t, 2, labels.Load(), "one label call per cluster")
-
-	topicsNamespace := topicsNamespaceFor(schemas.WarpDefaultLogVectorStoreNamespace)
-	ids := vectors.idsIn(topicsNamespace)
-	require.Len(t, ids, 2)
-	seen := map[string]int{}
-	for _, id := range ids {
-		meta := vectors.adds[id]
-		seen[meta["label"].(string)] = int(meta["size"].(int64))
-		require.Equal(t, true, meta["warp_topic"])
-		require.NotEmpty(t, meta["sample_log_ids"])
-		require.Len(t, vectors.embeddings[id], 3, "the centroid lives in the same space as the logs")
-	}
-	require.Equal(t, map[string]int{"Refund requests": 3, "Password resets": 3}, seen)
-
-	// How the run decided is part of its result: the threshold it derived,
-	// how many clusters it joined, and how tight each topic came out.
-	require.NotNil(t, final.MergeThreshold)
-	require.Greater(t, *final.MergeThreshold, 0.9)
-	require.Zero(t, final.Merged, "the two subjects are nothing alike")
-	require.Len(t, final.Topics, 2)
-	for _, topic := range final.Topics {
-		require.Contains(t, []string{"Refund requests", "Password resets"}, topic.Label)
-		require.Equal(t, 3, topic.Size)
-		require.Greater(t, topic.Cohesion, 0.9)
-	}
-	for _, id := range ids {
-		require.Greater(t, vectors.adds[id]["cohesion_milli"].(int64), int64(900))
-		require.Equal(t, int64(2), vectors.adds[id]["run_topics"], "each topic says how many its run wrote")
-		require.Equal(t, "job-1", vectors.adds[id]["run_id"])
-	}
-	require.Contains(t, final.Message, "Clustered 6 request(s) into 2 topic(s)")
-}
-
-// A recompute replaces the previous topics rather than piling onto them, so
-// the list never shows a stale cluster beside a fresh one.
-func TestWarpTopicsJobReplacesPreviousTopics(t *testing.T) {
-	start := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
-	vectors := newFakeWarpVectorStore()
-	logs := topicTestLogs(start)
-	for id, vector := range topicTestVectors() {
-		require.NoError(t, vectors.Add(context.Background(), schemas.WarpDefaultLogVectorStoreNamespace, id, vector, map[string]interface{}{"log_id": id, "timestamp": logs[id].Timestamp.Unix(), "warp_log": true}))
-	}
-	topicsNamespace := topicsNamespaceFor(schemas.WarpDefaultLogVectorStoreNamespace)
-	require.NoError(t, vectors.Add(context.Background(), topicsNamespace, "stale", []float32{0, 0, 1}, map[string]interface{}{"warp_topic": true, "label": "Old", "size": int64(9), "run_id": "job-before", "run_topics": int64(1), "computed_at": start.Unix()}))
-
-	// The model is unreachable this run: clusters still get written, with
-	// fallback names, and the failure is counted rather than fatal.
-	unreachable := func(context.Context, *schemas.BifrostResponsesRequest) (*schemas.BifrostResponsesResponse, *schemas.BifrostError) {
-		return nil, &schemas.BifrostError{Error: &schemas.ErrorField{Message: "no keys found that support model: openai/gpt-4o"}}
-	}
-	service := NewService(nil,
-		WithConfigStore(&recordingStore{row: validWarpConfigRow()}), WithLogReader(&semanticLogReader{logs: logs}),
-		WithVectorStore(vectors), WithEmbeddingExecutor(backfillEmbeddingExecutor), WithChatFunc(unreachable),
-	)
-	defer service.Shutdown()
-	metaJSON, err := service.BuildTopicsJobMeta(context.Background(), start, start.Add(24*time.Hour))
-	require.NoError(t, err)
-	finalJSON, err := service.RunTopicsJob(context.Background(), tables.TableSidekiqJob{Metadata: metaJSON}, func(string) error { return nil })
-	require.NoError(t, err)
-	require.NotContains(t, vectors.idsIn(topicsNamespace), "stale")
-	require.Len(t, vectors.idsIn(topicsNamespace), 2)
-	labels := map[string]bool{}
-	for _, id := range vectors.idsIn(topicsNamespace) {
-		labels[vectors.adds[id]["label"].(string)] = true
-	}
-	require.True(t, labels["refund"] || labels["password"] || len(labels) == 2, "fallback labels come from the questions' words: %v", labels)
-	var final BackfillJobMeta
-	require.NoError(t, sonic.Unmarshal([]byte(finalJSON), &final))
-	require.Equal(t, 2, final.Failed, "each failed label is counted")
-	require.Contains(t, final.LastError, "no keys found")
-}
-
-// list_topics is the tool that answers "what do people ask about": clusters
 // by size, with a share and links a reader can open.
-func TestWarpListTopicsToolReturnsSortedTopics(t *testing.T) {
-	vectors := newFakeWarpVectorStore()
-	topicsNamespace := topicsNamespaceFor(schemas.WarpDefaultLogVectorStoreNamespace)
-	now := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
-	for _, topic := range []struct {
-		id    string
-		label string
-		size  int64
-	}{{"t-small", "Password resets", 3}, {"t-big", "Refund requests", 9}} {
-		require.NoError(t, vectors.Add(context.Background(), topicsNamespace, topic.id, []float32{1, 0, 0}, map[string]interface{}{
-			"warp_topic": true, "topic_id": topic.id, "label": topic.label, "size": topic.size, "sample_log_ids": "log-1,log-2",
-			"window_start": now.Add(-24 * time.Hour).Unix(), "window_end": now.Unix(), "computed_at": now.Unix(), "total_clustered": int64(12),
-			"cohesion_milli": int64(875),
-		}))
-	}
-	reader := NewTopicReader(&recordingStore{row: validWarpConfigRow()}, vectors)
-	result, err := runTool(t, "list_topics", &ToolDeps{logManager: &fakeLogReader{}, topics: reader}, map[string]any{})
-	require.NoError(t, err)
-	out := result.(map[string]any)
-	topics := out["topics"].([]Topic)
-	require.Len(t, topics, 2)
-	require.Equal(t, "Refund requests", topics[0].Label)
-	require.Equal(t, 9, topics[0].Size)
-	require.InDelta(t, 0.75, topics[0].Share, 1e-9)
-	require.InDelta(t, 0.875, topics[0].Cohesion, 1e-9)
-	require.Equal(t, []string{logDetailLink("log-1"), logDetailLink("log-2")}, topics[0].SampleLinks)
-	require.Equal(t, 12, out["total_clustered"])
-	_, hasHint := out["hint"]
-	require.False(t, hasHint)
-
-	// A topic's links each open one conversation. They are named for what
-	// they are, and the result offers nothing that reads as "the requests
-	// behind this topic", because the Logs page cannot show that set: a
-	// topic's name linked to one request says nine and opens one.
-	encoded, err := sonic.MarshalString(out)
-	require.NoError(t, err)
-	require.Contains(t, encoded, `"example_links":["`+logDetailLink("log-1")+`","`+logDetailLink("log-2")+`"]`)
-	require.NotContains(t, encoded, "sample_links")
-	_, hasLogsLink := out["logs_link"]
-	require.False(t, hasLogsLink, "the unfiltered Logs page is not what a topic count covers")
-	require.Contains(t, out["links"], "one example request")
-	require.Contains(t, out["counts"], "count requests")
-	require.Contains(t, out["cannot_answer"], "a different time range")
-}
-
-func TestWarpListTopicsToolHintsWhenNothingComputed(t *testing.T) {
-	reader := NewTopicReader(&recordingStore{row: validWarpConfigRow()}, newFakeWarpVectorStore())
-	result, err := runTool(t, "list_topics", &ToolDeps{logManager: &fakeLogReader{}, topics: reader}, map[string]any{})
-	require.NoError(t, err)
-	out := result.(map[string]any)
-	require.Empty(t, out["topics"])
-	require.Contains(t, out["hint"], "No topic clusters have been computed")
-}
 
 // The prompt has to send topic questions here first.
+
 func TestWarpSystemPromptPrefersListTopics(t *testing.T) {
 	content := systemInstructions(&schemas.WarpConfig{}, true)
 	require.Contains(t, content, "call list_topics first")
@@ -381,7 +216,7 @@ func TestWarpTopicsJobAppliesWindowInCode(t *testing.T) {
 	require.NoError(t, vectors.Add(context.Background(), schemas.WarpDefaultLogVectorStoreNamespace, "not-a-log", []float32{0, 0, 1}, map[string]interface{}{"log_id": "not-a-log", "timestamp": start.Add(time.Hour).Unix()}))
 
 	service := NewService(nil,
-		WithConfigStore(&recordingStore{row: validWarpConfigRow()}), WithLogReader(&semanticLogReader{logs: logs}),
+		WithConfigStore(&recordingStore{row: validWarpConfigRow()}), WithLogReader(topicTestReader(t, logs)),
 		WithVectorStore(vectors), WithEmbeddingExecutor(backfillEmbeddingExecutor),
 		WithChatFunc(func(context.Context, *schemas.BifrostResponsesRequest) (*schemas.BifrostResponsesResponse, *schemas.BifrostError) {
 			return TextTurn("Topic"), nil
@@ -407,7 +242,7 @@ func topicTestService(t *testing.T, vectors *fakeWarpVectorStore, reader LogRead
 		require.NoError(t, vectors.Add(context.Background(), schemas.WarpDefaultLogVectorStoreNamespace, id, vector, map[string]interface{}{"log_id": id, "timestamp": logs[id].Timestamp.Unix(), "warp_log": true}))
 	}
 	if reader == nil {
-		reader = &semanticLogReader{logs: logs}
+		reader = topicTestReader(t, logs)
 	}
 	service := NewService(nil,
 		WithConfigStore(&recordingStore{row: validWarpConfigRow()}), WithLogReader(reader),
@@ -448,7 +283,7 @@ func (r *countingHydrator) GetLogsByIDs(ctx context.Context, ids []string) ([]lo
 // can have a hundred clusters.
 func TestWarpTopicsJobHydratesSamplesInOneQuery(t *testing.T) {
 	start := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
-	reader := &countingHydrator{semanticLogReader: &semanticLogReader{logs: topicTestLogs(start)}}
+	reader := &countingHydrator{semanticLogReader: topicTestReader(t, topicTestLogs(start))}
 	vectors := newFakeWarpVectorStore()
 	service, _ := topicTestService(t, vectors, reader, topicTestNaming)
 
@@ -456,7 +291,9 @@ func TestWarpTopicsJobHydratesSamplesInOneQuery(t *testing.T) {
 	require.NoError(t, err)
 	_, err = service.RunTopicsJob(context.Background(), tables.TableSidekiqJob{ID: "job-1", Metadata: metaJSON}, func(string) error { return nil })
 	require.NoError(t, err)
-	require.Len(t, vectors.idsIn(topicsNamespaceFor(schemas.WarpDefaultLogVectorStoreNamespace)), 2)
+	topics, err := service.topicStore().ListWarpTopics(context.Background(), logstore.WarpTopicFilter{})
+	require.NoError(t, err)
+	require.Len(t, topics, 2)
 	require.EqualValues(t, 1, reader.calls.Load())
 	require.Len(t, reader.sawIDs, 6, "the samples of both clusters, in the one query")
 }
@@ -489,69 +326,14 @@ func TestWarpTopicsJobLabelsClustersConcurrently(t *testing.T) {
 	require.EqualValues(t, 2, overlapped.Load(), "both label calls were in flight together")
 }
 
-// A run either replaces the topics or leaves them alone. When a topic cannot
-// be written, what the run did manage to write is taken back and the previous
-// topics stay, so a failed recompute never costs the answer that was there.
-func TestWarpTopicsJobKeepsPreviousTopicsWhenWriteFails(t *testing.T) {
-	vectors := newFakeWarpVectorStore()
-	service, start := topicTestService(t, vectors, nil, topicTestNaming)
-	topicsNamespace := topicsNamespaceFor(schemas.WarpDefaultLogVectorStoreNamespace)
-	require.NoError(t, vectors.Add(context.Background(), topicsNamespace, "previous", []float32{0, 0, 1}, map[string]interface{}{
-		"warp_topic": true, "label": "Old", "size": int64(9), "run_id": "job-before", "run_topics": int64(1), "computed_at": start.Unix(),
-	}))
-	metaJSON, err := service.BuildTopicsJobMeta(context.Background(), start, start.Add(24*time.Hour))
-	require.NoError(t, err)
-
-	// The second topic write fails: one new topic is already in the store.
-	vectors.failAddAfter(topicsNamespace, 1, fmt.Errorf("vector store unavailable"))
-	finalJSON, err := service.RunTopicsJob(context.Background(), tables.TableSidekiqJob{ID: "job-1", Metadata: metaJSON}, func(string) error { return nil })
-	require.ErrorContains(t, err, "vector store unavailable")
-	require.Equal(t, []string{"previous"}, vectors.idsIn(topicsNamespace))
-
-	var final BackfillJobMeta
-	require.NoError(t, sonic.Unmarshal([]byte(finalJSON), &final))
-	require.Zero(t, final.Indexed)
-	require.Empty(t, final.Topics)
-	require.Contains(t, final.Message, "previous topics were kept")
-}
-
 // While a run is writing, the store holds the previous topics and some of the
 // new ones. list_topics answers from the newest run that finished writing, so
 // a question asked in that moment gets the previous topics whole rather than
 // a few of the new ones.
-func TestWarpListTopicsServesNewestCompleteRun(t *testing.T) {
-	vectors := newFakeWarpVectorStore()
-	topicsNamespace := topicsNamespaceFor(schemas.WarpDefaultLogVectorStoreNamespace)
-	earlier := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
-	add := func(id, label, run string, runTopics int64, at time.Time, total int64) {
-		require.NoError(t, vectors.Add(context.Background(), topicsNamespace, id, []float32{1, 0, 0}, map[string]interface{}{
-			"warp_topic": true, "topic_id": id, "label": label, "size": int64(4), "run_id": run, "run_topics": runTopics,
-			"window_start": at.Add(-24 * time.Hour).Unix(), "window_end": at.Unix(), "computed_at": at.Unix(), "total_clustered": total,
-		}))
-	}
-	add("old-1", "Refund requests", "run-old", 2, earlier, 8)
-	add("old-2", "Password resets", "run-old", 2, earlier, 8)
-	add("new-1", "Billing", "run-new", 3, earlier.Add(time.Hour), 30)
-
-	reader := NewTopicReader(&recordingStore{row: validWarpConfigRow()}, vectors)
-	topics, total, err := reader.ListTopics(context.Background(), 15)
-	require.NoError(t, err)
-	require.Equal(t, 8, total)
-	require.Len(t, topics, 2)
-	require.ElementsMatch(t, []string{"Refund requests", "Password resets"}, []string{topics[0].Label, topics[1].Label})
-
-	// Once the new run has written everything it set out to, it takes over.
-	add("new-2", "Invoices", "run-new", 3, earlier.Add(time.Hour), 30)
-	add("new-3", "Refunds", "run-new", 3, earlier.Add(time.Hour), 30)
-	topics, total, err = reader.ListTopics(context.Background(), 15)
-	require.NoError(t, err)
-	require.Equal(t, 30, total)
-	require.Len(t, topics, 3)
-	require.ElementsMatch(t, []string{"Billing", "Invoices", "Refunds"}, []string{topics[0].Label, topics[1].Label, topics[2].Label})
-}
 
 // Cancelling has to reach a run that is still clustering, not only one that
 // has got as far as naming things.
+
 func TestWarpTopicsJobStopsWhileClustering(t *testing.T) {
 	vectors := newFakeWarpVectorStore()
 	var labelled atomic.Int32
@@ -567,7 +349,9 @@ func TestWarpTopicsJobStopsWhileClustering(t *testing.T) {
 	finalJSON, err := service.RunTopicsJob(ctx, tables.TableSidekiqJob{ID: "job-1", Metadata: metaJSON}, func(string) error { cancel(); return nil })
 	require.ErrorIs(t, err, context.Canceled)
 	require.Zero(t, labelled.Load(), "a cancelled run does not go on to spend model calls")
-	require.Empty(t, vectors.idsIn(topicsNamespaceFor(schemas.WarpDefaultLogVectorStoreNamespace)))
+	topics, err := service.topicStore().ListWarpTopics(context.Background(), logstore.WarpTopicFilter{})
+	require.NoError(t, err)
+	require.Empty(t, topics, "and writes nothing")
 	var final BackfillJobMeta
 	require.NoError(t, sonic.Unmarshal([]byte(finalJSON), &final))
 	require.Contains(t, final.Message, "Stopped while clustering")
@@ -591,36 +375,10 @@ func TestTopicsSeedFollowsTheWindow(t *testing.T) {
 	require.NotEqual(t, topicsSeed(meta), topicsSeed(other))
 }
 
-// The embedded and Pinecone stores keep each namespace's dimension in memory,
-// so after a restart they cannot page a namespace until it has been declared
-// again. Indexing declares the log namespace as a side effect; a process that
-// has indexed nothing since it started has not, and topics must still run -
-// and be readable - there.
-func TestWarpTopicsWorkOnAStoreThatForgetsNamespaces(t *testing.T) {
-	vectors := newFakeWarpVectorStore()
-	service, start := topicTestService(t, vectors, nil, topicTestNaming)
-	vectors.strict = true
-
-	metaJSON, err := service.BuildTopicsJobMeta(context.Background(), start, start.Add(24*time.Hour))
-	require.NoError(t, err)
-	finalJSON, err := service.RunTopicsJob(context.Background(), tables.TableSidekiqJob{ID: "job-1", Metadata: metaJSON}, func(string) error { return nil })
-	require.NoError(t, err)
-	var final BackfillJobMeta
-	require.NoError(t, sonic.Unmarshal([]byte(finalJSON), &final))
-	require.Equal(t, 6, final.Scanned)
-	require.Equal(t, 2, final.Indexed)
-
-	// A reader in a process that has declared nothing.
-	vectors.created = nil
-	topics, total, err := NewTopicReader(&recordingStore{row: validWarpConfigRow()}, vectors).ListTopics(context.Background(), 15)
-	require.NoError(t, err)
-	require.Len(t, topics, 2)
-	require.Equal(t, 6, total)
-}
-
 // A store that returns conversations without their vectors cannot be
 // clustered. That has to be said, not reported as an empty window: "nothing
 // to cluster" sends an operator looking for missing data that is right there.
+
 func TestWarpTopicsJobReportsAStoreThatReturnsNoVectors(t *testing.T) {
 	vectors := newFakeWarpVectorStore()
 	service, start := topicTestService(t, vectors, nil, topicTestNaming)
@@ -729,77 +487,11 @@ func TestTopicLabelsReadTheOpeningQuestion(t *testing.T) {
 	require.Empty(t, logUserText(hidden))
 }
 
-// Topics are computed over every request in the deployment, and a topic is
-// not a row: the store's row-level scope, which guards every other read, has
-// nothing to apply to. A caller who may only see part of the traffic would be
-// handed names, sizes and example requests drawn from all of it. So the tool
-// answers only a caller nothing restricts, and sends the rest to the sample,
-// which the store does scope.
-func TestWarpListTopicsIsWithheldFromARestrictedCaller(t *testing.T) {
-	vectors := newFakeWarpVectorStore()
-	topicsNamespace := topicsNamespaceFor(schemas.WarpDefaultLogVectorStoreNamespace)
-	now := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
-	require.NoError(t, vectors.Add(context.Background(), topicsNamespace, "t-1", []float32{1, 0, 0}, map[string]interface{}{
-		"warp_topic": true, "topic_id": "t-1", "label": "Refund requests", "size": int64(9), "sample_log_ids": "log-1",
-		"computed_at": now.Unix(), "total_clustered": int64(9), "run_id": "run", "run_topics": int64(1),
-	}))
-	deps := &ToolDeps{logManager: &fakeLogReader{}, topics: NewTopicReader(&recordingStore{row: validWarpConfigRow()}, vectors)}
-	tool, ok := toolByName(buildTools(), "list_topics")
-	require.True(t, ok)
-
-	for name, ctx := range map[string]context.Context{
-		"row scope":       queryscope.WithQueryScope(context.Background(), func(db *gorm.DB) *gorm.DB { return db }),
-		"dimension scope": queryscope.WithDimensionScope(context.Background(), func(string) ([]string, bool) { return nil, true }),
-	} {
-		result, err := tool.execute(ctx, deps, map[string]any{})
-		require.NoError(t, err, name)
-		out := result.(map[string]any)
-		encoded, err := sonic.MarshalString(out)
-		require.NoError(t, err)
-		require.NotContains(t, encoded, "Refund requests", name)
-		require.NotContains(t, encoded, "log-1", name)
-		require.Equal(t, false, out["available"], name)
-		require.Contains(t, out["hint"], "take one bounded sample", name)
-	}
-
-	result, err := tool.execute(context.Background(), deps, map[string]any{})
-	require.NoError(t, err)
-	require.Len(t, result.(map[string]any)["topics"], 1, "a caller nothing restricts gets the topics")
-}
-
 // Two clusters that come back with the same name are one topic to anyone
 // reading the list, however far apart their centres are. On real traffic the
 // same name turned up on clusters between 0.70 and 0.93 alike, while clusters
 // that were plainly different sat at 0.94 - so no similarity threshold could
 // have joined the first without joining the second. The name can.
-func TestWarpTopicsJobJoinsClustersGivenTheSameName(t *testing.T) {
-	vectors := newFakeWarpVectorStore()
-	// Every cluster is given the same name, whatever it holds.
-	service, start := topicTestService(t, vectors, nil, topicTestChat("  refund Requests "))
-	metaJSON, err := service.BuildTopicsJobMeta(context.Background(), start, start.Add(24*time.Hour))
-	require.NoError(t, err)
-	finalJSON, err := service.RunTopicsJob(context.Background(), tables.TableSidekiqJob{ID: "job-1", Metadata: metaJSON}, func(string) error { return nil })
-	require.NoError(t, err)
-
-	topicsNamespace := topicsNamespaceFor(schemas.WarpDefaultLogVectorStoreNamespace)
-	ids := vectors.idsIn(topicsNamespace)
-	require.Len(t, ids, 1)
-	stored := vectors.adds[ids[0]]
-	require.Equal(t, "refund Requests", stored["label"])
-	require.Equal(t, int64(6), stored["size"], "the joined topic holds both clusters' requests")
-	require.Equal(t, int64(1), stored["run_topics"])
-	require.Len(t, strings.Split(stored["sample_log_ids"].(string), ","), topicsLabelSamples)
-	require.InDelta(t, 1, float64(dot(vectors.embeddings[ids[0]], vectors.embeddings[ids[0]])), 1e-5, "the centre is recomputed from every member")
-
-	var final BackfillJobMeta
-	require.NoError(t, sonic.Unmarshal([]byte(finalJSON), &final))
-	require.Equal(t, 1, final.Indexed)
-	require.Equal(t, 1, final.MergedByName)
-	require.Len(t, final.Topics, 1)
-	require.Equal(t, 6, final.Topics[0].Size)
-	require.Less(t, final.Topics[0].Cohesion, 0.9, "two subjects under one name are looser than either alone, and say so")
-	require.Contains(t, final.Message, "1 more joined for sharing a name")
-}
 
 // TestWarpTopicsJobAgainstLiveVectorStores runs the whole job - read, cluster,
 // name, write, replace, list - against each backend Bifrost supports.
@@ -812,107 +504,12 @@ func TestWarpTopicsJobJoinsClustersGivenTheSameName(t *testing.T) {
 //
 // It needs the services of tests/docker-compose.yml, so it runs only when
 // WARP_LIVE_VECTORSTORES is set. Hosts follow the vectorstore tests' variables.
-func TestWarpTopicsJobAgainstLiveVectorStores(t *testing.T) {
-	if os.Getenv("WARP_LIVE_VECTORSTORES") == "" {
-		t.Skip("set WARP_LIVE_VECTORSTORES=1 with the vector stores running to run this")
-	}
-	env := func(key, fallback string) string {
-		if value := os.Getenv(key); value != "" {
-			return value
-		}
-		return fallback
-	}
-	logger := bifrost.NewDefaultLogger(schemas.LogLevelError)
-	sv := func(v string) *schemas.SecretVar { return schemas.NewSecretVar(v) }
-	configs := map[string]*vectorstore.Config{
-		"chromem":  {Enabled: true, Type: vectorstore.VectorStoreTypeChromem, Config: vectorstore.ChromemConfig{}},
-		"weaviate": {Enabled: true, Type: vectorstore.VectorStoreTypeWeaviate, Config: vectorstore.WeaviateConfig{Scheme: "http", Host: sv(env("WEAVIATE_HOST", "localhost:9000"))}},
-		"qdrant":   {Enabled: true, Type: vectorstore.VectorStoreTypeQdrant, Config: vectorstore.QdrantConfig{Host: *sv(env("QDRANT_HOST", "localhost")), Port: *sv(env("QDRANT_PORT", "6334"))}},
-		"redis":    {Enabled: true, Type: vectorstore.VectorStoreTypeRedis, Config: vectorstore.RedisConfig{Addr: sv(env("REDIS_ADDR", "localhost:6379"))}},
-		"pinecone": {Enabled: true, Type: vectorstore.VectorStoreTypePinecone, Config: vectorstore.PineconeConfig{APIKey: *sv(env("PINECONE_API_KEY", "pclocal")), IndexHost: *sv(env("PINECONE_INDEX_HOST", "localhost:5081"))}},
-	}
-	for _, name := range []string{"chromem", "weaviate", "qdrant", "redis", "pinecone"} {
-		t.Run(name, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-			defer cancel()
-			store, err := vectorstore.NewVectorStore(ctx, configs[name], logger)
-			require.NoError(t, err)
-			namespace := fmt.Sprintf("WarpLive%d", time.Now().UnixNano()%1000000)
-			row := validWarpConfigRow()
-			row.LogVectorStoreNamespace = namespace
-			config := configFromRow(row)
-			topicsNamespace := topicsNamespaceFor(namespace)
-			t.Cleanup(func() {
-				_ = store.DeleteNamespace(context.Background(), namespace)
-				_ = store.DeleteNamespace(context.Background(), topicsNamespace)
-			})
-			_, err = ensureWarpNamespace(ctx, store, namespace, config.EmbeddingDimension)
-			require.NoError(t, err)
-
-			start := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
-			rng := rand.New(rand.NewSource(1))
-			logs := map[string]logstore.Log{}
-			const perSubject = 130 // two pages of 200 between them, so paging is exercised
-			for subject, question := range []string{"how do I get a refund", "reset my password please"} {
-				for n := range perSubject {
-					id := uuid.NewString()
-					vector := make([]float32, config.EmbeddingDimension)
-					for d := range vector {
-						vector[d] = float32(rng.NormFloat64() * 0.01)
-					}
-					vector[subject] = 1
-					at := start.Add(time.Duration(n) * time.Minute)
-					logs[id] = logstore.Log{ID: id, Timestamp: at, Object: string(schemas.ChatCompletionRequest), Status: "success", ContentSummary: question}
-					require.NoError(t, store.Add(ctx, namespace, id, unitVector(vector), map[string]interface{}{
-						"log_id": id, "timestamp": at.Unix(), "warp_log": true, "status": "success", "object": "chat_completion",
-						"provider": "openai", "model": "gpt-4o", "team_ids": []string{}, "customer_ids": []string{}, "business_unit_ids": []string{},
-					}))
-				}
-			}
-			time.Sleep(2 * time.Second)
-
-			service := NewService(nil,
-				WithConfigStore(&recordingStore{row: row}), WithLogReader(&semanticLogReader{logs: logs}),
-				WithVectorStore(store), WithEmbeddingExecutor(backfillEmbeddingExecutor), WithChatFunc(topicTestNaming),
-			)
-			defer service.Shutdown()
-			reader := NewTopicReader(&recordingStore{row: row}, store)
-
-			for run := 1; run <= 2; run++ {
-				metaJSON, err := service.BuildTopicsJobMeta(ctx, start, start.Add(24*time.Hour))
-				require.NoError(t, err)
-				finalJSON, err := service.RunTopicsJob(ctx, tables.TableSidekiqJob{ID: uuid.NewString(), Metadata: metaJSON}, func(string) error { return nil })
-				require.NoError(t, err, "run %d", run)
-				var final BackfillJobMeta
-				require.NoError(t, sonic.Unmarshal([]byte(finalJSON), &final))
-				require.Equal(t, 2*perSubject, final.Scanned, "run %d reads every vector", run)
-				require.Equal(t, 2, final.Indexed, "run %d", run)
-				require.Empty(t, final.LastError, "run %d", run)
-				time.Sleep(2 * time.Second)
-
-				topics, total, err := reader.ListTopics(ctx, 15)
-				require.NoError(t, err, "run %d", run)
-				require.Equal(t, 2*perSubject, total)
-				require.Len(t, topics, 2, "run %d leaves only its own topics", run)
-				for _, topic := range topics {
-					require.GreaterOrEqual(t, topic.Size, perSubject-5)
-					require.Len(t, topic.SampleLogIDs, topicsLabelSamples)
-					require.Greater(t, topic.Cohesion, 0.5)
-					require.Equal(t, start.Unix(), topic.WindowStart.Unix())
-				}
-				all, _, err := store.GetAll(ctx, topicsNamespace, nil, []string{"label", "run_id"}, nil, 100)
-				require.NoError(t, err)
-				require.Len(t, all, 2, "run %d: nothing stale is left in the store", run)
-				time.Sleep(1100 * time.Millisecond) // computed_at is in seconds
-			}
-		})
-	}
-}
 
 // Stores do not agree on what a property comes back as. Most decode numbers
 // and booleans; Redis keeps every field as text and returns it that way, and
 // a job that read only the typed forms took "true" and "1788000000" for
 // missing values and found nothing to cluster.
+
 func TestTopicPropertiesAreReadWhateverTheStoreReturns(t *testing.T) {
 	for _, value := range []interface{}{1788000000, int64(1788000000), float64(1788000000), "1788000000", " 1788000000 ", "1788000000.0"} {
 		require.Equal(t, 1788000000, propertyInt(value), "%#v", value)
@@ -947,7 +544,7 @@ func TestWarpTopicsJobCountsARepeatedEntryOnce(t *testing.T) {
 		require.NoError(t, vectors.Add(context.Background(), schemas.WarpDefaultLogVectorStoreNamespace, id, vector, map[string]interface{}{"log_id": id, "timestamp": logs[id].Timestamp.Unix(), "warp_log": true}))
 	}
 	service := NewService(nil,
-		WithConfigStore(&recordingStore{row: validWarpConfigRow()}), WithLogReader(&semanticLogReader{logs: logs}),
+		WithConfigStore(&recordingStore{row: validWarpConfigRow()}), WithLogReader(topicTestReader(t, logs)),
 		WithVectorStore(&repeatingStore{vectors}), WithEmbeddingExecutor(backfillEmbeddingExecutor), WithChatFunc(topicTestNaming),
 	)
 	defer service.Shutdown()
@@ -958,4 +555,643 @@ func TestWarpTopicsJobCountsARepeatedEntryOnce(t *testing.T) {
 	var final BackfillJobMeta
 	require.NoError(t, sonic.Unmarshal([]byte(finalJSON), &final))
 	require.Equal(t, 6, final.Scanned)
+}
+
+// topicTestLogStore is a real SQLite log store. The topics are rows in it and
+// the job copies each request's columns from its log row, so a fake would
+// have to reproduce the store to prove anything.
+func topicTestLogStore(t *testing.T) logstore.LogStore {
+	t.Helper()
+	store, err := logstore.NewLogStore(context.Background(), &logstore.Config{
+		Enabled: true, Type: logstore.LogStoreTypeSQLite,
+		Config: &logstore.SQLiteConfig{Path: filepath.Join(t.TempDir(), "warp.db")},
+	}, bifrost.NewDefaultLogger(schemas.LogLevelError))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.Close(context.Background()) })
+	return store
+}
+
+// topicTestReader is the reader the topic tests run through: the given logs
+// for hydration, and the same logs in a log store that keeps the topic tables.
+func topicTestReader(t *testing.T, logs map[string]logstore.Log) *semanticLogReader {
+	t.Helper()
+	store := topicTestLogStore(t)
+	for _, entry := range logs {
+		require.NoError(t, store.Create(context.Background(), &entry))
+	}
+	return &semanticLogReader{logs: logs, topics: store}
+}
+
+// topicTestSignature is the embedding signature the test configuration
+// carries, which is what every topic row is stamped with.
+func topicTestSignature() string {
+	return embeddingConfigSignature(configFromRow(validWarpConfigRow()))
+}
+
+func topicLabelsByID(topics []logstore.WarpTopic) map[string]string {
+	labels := make(map[string]string, len(topics))
+	for _, topic := range topics {
+		labels[topic.ID] = topic.Label
+	}
+	return labels
+}
+
+// The job reads the log vectors, clusters them, labels each cluster through
+// the model, and files the result in the log store: one row per topic, and
+// one row per request saying which topic it is in.
+func TestWarpTopicsJobClustersLabelsAndStores(t *testing.T) {
+	var labels atomic.Int32
+	chat := func(ctx context.Context, req *schemas.BifrostResponsesRequest) (*schemas.BifrostResponsesResponse, *schemas.BifrostError) {
+		labels.Add(1)
+		require.Nil(t, req.Params.Tools, "labelling is a plain completion, no tools")
+		if contains(responsesInputText(req.Input), "refund") {
+			return TextTurn("Refund requests"), nil
+		}
+		return TextTurn("Password resets"), nil
+	}
+	service, start := topicTestService(t, newFakeWarpVectorStore(), nil, chat)
+	store := service.topicStore()
+	ctx := context.Background()
+
+	metaJSON, err := service.BuildTopicsJobMeta(ctx, start, start.Add(24*time.Hour))
+	require.NoError(t, err)
+	finalJSON, err := service.RunTopicsJob(ctx, tables.TableSidekiqJob{ID: "job-1", Metadata: metaJSON}, func(string) error { return nil })
+	require.NoError(t, err)
+
+	var final BackfillJobMeta
+	require.NoError(t, sonic.Unmarshal([]byte(finalJSON), &final))
+	require.Equal(t, 6, final.Scanned, "every vector in the window is read")
+	require.Equal(t, 2, final.Indexed, "one topic per cluster")
+	require.Zero(t, final.Failed)
+	require.Zero(t, final.Skipped)
+	require.EqualValues(t, 2, labels.Load(), "one label call per cluster")
+
+	topics, err := store.ListWarpTopics(ctx, logstore.WarpTopicFilter{})
+	require.NoError(t, err)
+	require.Len(t, topics, 2)
+	for _, topic := range topics {
+		require.Equal(t, logstore.WarpTopicKindTopic, topic.Kind)
+		require.Equal(t, logstore.WarpTopicStatusActive, topic.Status)
+		require.Equal(t, topicTestSignature(), topic.EmbeddingSignature, "a topic says which embedding model it was built with")
+		centroid, err := logstore.DecodeWarpVector(topic.Centroid)
+		require.NoError(t, err)
+		require.Len(t, centroid, 3, "the centroid lives in the same space as the logs")
+		require.Len(t, topic.ExampleLogIDs(), 3, "every member of a cluster of three is an example")
+		require.Greater(t, topic.Cohesion, 0.9)
+	}
+	usage, err := store.SummarizeWarpTopicAssignments(ctx, logstore.WarpTopicAssignmentFilter{})
+	require.NoError(t, err)
+	byLabel := topicLabelsByID(topics)
+	seen := map[string]int{}
+	for _, entry := range usage {
+		seen[byLabel[entry.TopicID]] = int(entry.Requests)
+	}
+	require.Equal(t, map[string]int{"Refund requests": 3, "Password resets": 3}, seen)
+
+	// How the run decided is part of its result: the threshold it derived,
+	// how many clusters it joined, and how tight each topic came out.
+	require.NotNil(t, final.MergeThreshold)
+	require.Greater(t, *final.MergeThreshold, 0.9)
+	require.Zero(t, final.Merged, "the two subjects are nothing alike")
+	require.Len(t, final.Topics, 2)
+	for _, topic := range final.Topics {
+		require.Contains(t, []string{"Refund requests", "Password resets"}, topic.Label)
+		require.Equal(t, 3, topic.Size)
+		require.Greater(t, topic.Cohesion, 0.9)
+	}
+	require.Contains(t, final.Message, "Clustered 6 request(s) into 2 topic(s)")
+}
+
+// Every request the run read is filed with the columns a topic question is
+// asked by - who sent it, what it cost - copied from its log row, not from
+// the vector's metadata, which is a lossy copy of them.
+func TestWarpTopicsJobFilesEveryRequestFromItsLog(t *testing.T) {
+	start := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	logs := topicTestLogs(start)
+	first := logs["log-0"]
+	team, app, cost, session := "team-a", "cursor", 0.5, "session-1"
+	first.TeamID, first.App, first.Cost, first.SessionID = &team, &app, &cost, &session
+	first.Provider, first.Model, first.TotalTokens = "openai", "gpt-4o", 42
+	logs["log-0"] = first
+	service, _ := topicTestService(t, newFakeWarpVectorStore(), topicTestReader(t, logs), topicTestNaming)
+	store := service.topicStore()
+	ctx := context.Background()
+
+	metaJSON, err := service.BuildTopicsJobMeta(ctx, start, start.Add(24*time.Hour))
+	require.NoError(t, err)
+	_, err = service.RunTopicsJob(ctx, tables.TableSidekiqJob{ID: "job-1", Metadata: metaJSON}, func(string) error { return nil })
+	require.NoError(t, err)
+
+	all, err := store.ListWarpTopicAssignments(ctx, logstore.WarpTopicAssignmentFilter{}, 100)
+	require.NoError(t, err)
+	require.Len(t, all, 6, "one row per request read")
+	topics, err := store.ListWarpTopics(ctx, logstore.WarpTopicFilter{Statuses: []string{logstore.WarpTopicStatusActive}})
+	require.NoError(t, err)
+	byLabel := topicLabelsByID(topics)
+	for _, row := range all {
+		require.NotEmpty(t, row.TopicID, "every request here is in a topic")
+		require.Greater(t, row.Similarity, 0.9, "and was close to its centre")
+		require.False(t, row.AssignedAt.IsZero())
+		require.True(t, row.Timestamp.Equal(logs[row.LogID].Timestamp), "%s: %s", row.LogID, row.Timestamp)
+	}
+	filed, err := store.ListWarpTopicAssignments(ctx, logstore.WarpTopicAssignmentFilter{LogIDs: []string{"log-0"}}, 1)
+	require.NoError(t, err)
+	require.Len(t, filed, 1)
+	require.Equal(t, "Refund requests", byLabel[filed[0].TopicID])
+	require.Equal(t, "team-a", filed[0].TeamID)
+	require.Equal(t, "cursor", filed[0].App)
+	require.Equal(t, "session-1", filed[0].SessionID)
+	require.Equal(t, "gpt-4o", filed[0].Model)
+	require.InDelta(t, 0.5, filed[0].Cost, 1e-9)
+	require.Equal(t, 42, filed[0].TotalTokens)
+
+	// Which is what lets the rows be counted the way logs are.
+	usage, err := store.SummarizeWarpTopicAssignments(ctx, logstore.WarpTopicAssignmentFilter{TeamIDs: []string{"team-a"}})
+	require.NoError(t, err)
+	require.Len(t, usage, 1)
+	require.EqualValues(t, 1, usage[0].Requests)
+	require.InDelta(t, 0.5, usage[0].Cost, 1e-9)
+}
+
+// A request indexed and then deleted from the log store has no row to copy.
+// It is counted as skipped and said so, not filed from nothing.
+func TestWarpTopicsJobSkipsRequestsWhoseLogIsGone(t *testing.T) {
+	start := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	logs := topicTestLogs(start)
+	reader := topicTestReader(t, logs)
+	require.NoError(t, reader.topics.(logstore.LogStore).DeleteLog(context.Background(), "log-5"))
+	service, _ := topicTestService(t, newFakeWarpVectorStore(), reader, topicTestNaming)
+	ctx := context.Background()
+
+	metaJSON, err := service.BuildTopicsJobMeta(ctx, start, start.Add(24*time.Hour))
+	require.NoError(t, err)
+	finalJSON, err := service.RunTopicsJob(ctx, tables.TableSidekiqJob{ID: "job-1", Metadata: metaJSON}, func(string) error { return nil })
+	require.NoError(t, err)
+	var final BackfillJobMeta
+	require.NoError(t, sonic.Unmarshal([]byte(finalJSON), &final))
+	require.Equal(t, 6, final.Scanned, "the vector was still read and clustered")
+	require.Equal(t, 1, final.Skipped)
+	require.Contains(t, final.Message, "1 were indexed but are no longer in the log store")
+	all, err := service.topicStore().ListWarpTopicAssignments(ctx, logstore.WarpTopicAssignmentFilter{}, 100)
+	require.NoError(t, err)
+	require.Len(t, all, 5)
+}
+
+// The requests that matched no topic are kept with their vectors, so the next
+// discovery can start from them. A request that is in a topic now is taken
+// out of that pool, wherever an earlier run had left it.
+func TestWriteTopicsPoolsWhatMatchedNoTopic(t *testing.T) {
+	start := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	logs := topicTestLogs(start)
+	store := topicTestReader(t, logs).topics
+	ctx := context.Background()
+	vectors := topicTestVectors()
+	// log-0 was pooled by an earlier run.
+	require.NoError(t, store.AddWarpTopicUnmatched(ctx, []logstore.WarpTopicUnmatched{{
+		LogID: "log-0", Timestamp: logs["log-0"].Timestamp, Vector: logstore.EncodeWarpVector(vectors["log-0"]), EmbeddingSignature: "sig",
+	}}))
+
+	cluster := topicCluster{sum: make([]float32, 3), label: "Refund requests", sampleIDs: []string{"log-0", "log-1"}}
+	for _, id := range []string{"log-0", "log-1", "log-2", "log-3"} {
+		for d, value := range vectors[id] {
+			cluster.sum[d] += value
+		}
+		cluster.size++
+		cluster.members = append(cluster.members, topicMember{logID: id, similarity: 0.8})
+	}
+	run := &topicRun{floor: 0.5, pooled: []topicVector{{logID: "log-4", vector: vectors["log-4"]}, {logID: "log-5", vector: vectors["log-5"]}}}
+	meta := BackfillJobMeta{ConfigSignature: "sig", StartTime: start, EndTime: start.Add(24 * time.Hour)}
+	written, err := writeTopics(ctx, store, &meta, run, []topicCluster{cluster})
+	require.NoError(t, err)
+	require.Len(t, written, 1)
+	require.InDelta(t, 0.5, written[0].AssignFloor, 1e-9, "the floor the run settled on travels with the topic")
+	require.Equal(t, 1, meta.Indexed)
+	require.Zero(t, meta.Skipped)
+
+	usage, err := store.SummarizeWarpTopicAssignments(ctx, logstore.WarpTopicAssignmentFilter{})
+	require.NoError(t, err)
+	counts := map[string]int64{}
+	for _, entry := range usage {
+		counts[entry.TopicID] = entry.Requests
+	}
+	require.Equal(t, map[string]int64{written[0].ID: 4, "": 2}, counts, "the unmatched requests are filed too, under no topic")
+
+	pooled, err := store.ListWarpTopicUnmatched(ctx, "sig", 10)
+	require.NoError(t, err)
+	require.Equal(t, []string{"log-5", "log-4"}, warpUnmatchedIDs(pooled), "pooled with their vectors; log-0 is in a topic now and left the pool")
+	vector, err := logstore.DecodeWarpVector(pooled[0].Vector)
+	require.NoError(t, err)
+	require.Equal(t, vectors["log-5"], vector)
+}
+
+func warpUnmatchedIDs(rows []logstore.WarpTopicUnmatched) []string {
+	ids := make([]string, 0, len(rows))
+	for _, row := range rows {
+		ids = append(ids, row.LogID)
+	}
+	return ids
+}
+
+// A recompute replaces the previous topics: they are retired rather than
+// deleted, so a request filed under one keeps its row, but the list never
+// shows a stale topic beside a fresh one or counts a request filed under one.
+func TestWarpTopicsJobReplacesPreviousTopics(t *testing.T) {
+	// The model is unreachable this run: clusters still get written, with
+	// fallback names, and the failure is counted rather than fatal.
+	unreachable := func(context.Context, *schemas.BifrostResponsesRequest) (*schemas.BifrostResponsesResponse, *schemas.BifrostError) {
+		return nil, &schemas.BifrostError{Error: &schemas.ErrorField{Message: "no keys found that support model: openai/gpt-4o"}}
+	}
+	service, start := topicTestService(t, newFakeWarpVectorStore(), nil, unreachable)
+	store := service.topicStore()
+	ctx := context.Background()
+	require.NoError(t, store.UpsertWarpTopics(ctx, []logstore.WarpTopic{{
+		ID: "stale", Label: "Old", EmbeddingSignature: topicTestSignature(), Centroid: logstore.EncodeWarpVector([]float32{0, 0, 1}),
+	}}))
+	require.NoError(t, store.UpsertWarpTopicAssignments(ctx, []logstore.WarpTopicAssignment{{LogID: "earlier", TopicID: "stale", Timestamp: start.Add(-time.Hour)}}))
+
+	metaJSON, err := service.BuildTopicsJobMeta(ctx, start, start.Add(24*time.Hour))
+	require.NoError(t, err)
+	finalJSON, err := service.RunTopicsJob(ctx, tables.TableSidekiqJob{Metadata: metaJSON}, func(string) error { return nil })
+	require.NoError(t, err)
+
+	topics, err := store.ListWarpTopics(ctx, logstore.WarpTopicFilter{})
+	require.NoError(t, err)
+	require.Len(t, topics, 3, "the previous topic keeps its row")
+	labels := map[string]bool{}
+	for _, topic := range topics {
+		if topic.ID == "stale" {
+			require.Equal(t, logstore.WarpTopicStatusRetired, topic.Status)
+			continue
+		}
+		require.Equal(t, logstore.WarpTopicStatusActive, topic.Status)
+		labels[topic.Label] = true
+	}
+	require.True(t, labels["refund"] || labels["password"] || len(labels) == 2, "fallback labels come from the questions' words: %v", labels)
+	var final BackfillJobMeta
+	require.NoError(t, sonic.Unmarshal([]byte(finalJSON), &final))
+	require.Equal(t, 2, final.Failed, "each failed label is counted")
+	require.Contains(t, final.LastError, "no keys found")
+
+	listed, total, err := NewTopicReader(&recordingStore{row: validWarpConfigRow()}, store).ListTopics(ctx, 15)
+	require.NoError(t, err)
+	require.Len(t, listed, 2)
+	require.Equal(t, 6, total, "the request filed under the retired topic is not counted")
+}
+
+// A run that cannot finish writing retires what it wrote and leaves the
+// previous topics as they were, so a question asked afterwards is answered
+// from a whole set of topics rather than a few of the new ones.
+func TestWarpTopicsJobKeepsPreviousTopicsWhenWriteFails(t *testing.T) {
+	start := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	logs := topicTestLogs(start)
+	reader := topicTestReader(t, logs)
+	store := reader.topics.(logstore.LogStore)
+	reader.topics = &failingTopicStore{LogStore: store, err: fmt.Errorf("log store unavailable")}
+	service, _ := topicTestService(t, newFakeWarpVectorStore(), reader, topicTestNaming)
+	ctx := context.Background()
+	require.NoError(t, store.UpsertWarpTopics(ctx, []logstore.WarpTopic{{ID: "previous", Label: "Old", EmbeddingSignature: topicTestSignature()}}))
+
+	metaJSON, err := service.BuildTopicsJobMeta(ctx, start, start.Add(24*time.Hour))
+	require.NoError(t, err)
+	finalJSON, err := service.RunTopicsJob(ctx, tables.TableSidekiqJob{ID: "job-1", Metadata: metaJSON}, func(string) error { return nil })
+	require.ErrorContains(t, err, "log store unavailable")
+
+	active, err := store.ListWarpTopics(ctx, logstore.WarpTopicFilter{Statuses: []string{logstore.WarpTopicStatusActive}})
+	require.NoError(t, err)
+	require.Len(t, active, 1)
+	require.Equal(t, "previous", active[0].ID)
+	all, err := store.ListWarpTopics(ctx, logstore.WarpTopicFilter{})
+	require.NoError(t, err)
+	require.Len(t, all, 3, "the new topics were written and then retired")
+
+	var final BackfillJobMeta
+	require.NoError(t, sonic.Unmarshal([]byte(finalJSON), &final))
+	require.Zero(t, final.Indexed)
+	require.Empty(t, final.Topics)
+	require.Contains(t, final.Message, "previous topics were kept")
+}
+
+// failingTopicStore is a log store whose assignment writes fail.
+type failingTopicStore struct {
+	logstore.LogStore
+	err error
+}
+
+func (f *failingTopicStore) UpsertWarpTopicAssignments(context.Context, []logstore.WarpTopicAssignment) error {
+	return f.err
+}
+
+// Topics live in the log store, so Warp has them only through a reader that
+// can reach it. Without one there is no job to start and no tool to answer,
+// and a reader bound later brings them with it.
+func TestWarpTopicsNeedALogStoreThatKeepsThem(t *testing.T) {
+	start := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	logs := topicTestLogs(start)
+	service := NewService(nil,
+		WithConfigStore(&recordingStore{row: validWarpConfigRow()}), WithLogReader(&semanticLogReader{logs: logs}),
+		WithVectorStore(newFakeWarpVectorStore()), WithEmbeddingExecutor(backfillEmbeddingExecutor), WithChatFunc(topicTestNaming),
+	)
+	defer service.Shutdown()
+	require.Nil(t, service.topicLister())
+	_, err := service.BuildTopicsJobMeta(context.Background(), start, start.Add(24*time.Hour))
+	require.ErrorIs(t, err, ErrUnavailable)
+
+	service.SetLogReader(topicTestReader(t, logs))
+	require.NotNil(t, service.topicLister())
+	_, err = service.BuildTopicsJobMeta(context.Background(), start, start.Add(24*time.Hour))
+	require.NoError(t, err)
+
+	service.SetLogReader(nil)
+	require.Nil(t, service.topicLister())
+}
+
+// list_topics is the tool that answers "what do people ask about": topics by
+// size, with a share and links a reader can open, counted from the rows.
+func TestWarpListTopicsToolReturnsSortedTopics(t *testing.T) {
+	store := topicTestLogStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	require.NoError(t, store.UpsertWarpTopics(ctx, []logstore.WarpTopic{
+		{ID: "t-small", Label: "Password resets", Cohesion: 0.5, ExampleLogIDsJSON: `["log-1","log-2"]`, EmbeddingSignature: topicTestSignature(), CreatedAt: now},
+		{ID: "t-big", Label: "Refund requests", Cohesion: 0.875, ExampleLogIDsJSON: `["log-1","log-2"]`, EmbeddingSignature: topicTestSignature(), CreatedAt: now},
+	}))
+	var rows []logstore.WarpTopicAssignment
+	for index := range 12 {
+		topic := "t-big"
+		if index < 3 {
+			topic = "t-small"
+		}
+		rows = append(rows, logstore.WarpTopicAssignment{LogID: fmt.Sprintf("log-%d", index), TopicID: topic, Timestamp: now.Add(-time.Duration(index) * time.Minute)})
+	}
+	require.NoError(t, store.UpsertWarpTopicAssignments(ctx, rows))
+
+	reader := NewTopicReader(&recordingStore{row: validWarpConfigRow()}, store)
+	result, err := runTool(t, "list_topics", &ToolDeps{logManager: &fakeLogReader{}, topics: reader}, map[string]any{})
+	require.NoError(t, err)
+	out := result.(map[string]any)
+	topics := out["topics"].([]Topic)
+	require.Len(t, topics, 2)
+	require.Equal(t, "Refund requests", topics[0].Label)
+	require.Equal(t, 9, topics[0].Size)
+	require.InDelta(t, 0.75, topics[0].Share, 1e-9)
+	require.InDelta(t, 0.875, topics[0].Cohesion, 1e-9)
+	require.Equal(t, []string{logDetailLink("log-1"), logDetailLink("log-2")}, topics[0].SampleLinks)
+	require.Equal(t, 12, out["total_clustered"])
+	require.Equal(t, now.Format(time.RFC3339), out["computed_at"])
+	_, hasHint := out["hint"]
+	require.False(t, hasHint)
+
+	// A topic's links each open one conversation. They are named for what
+	// they are, and the result offers nothing that reads as "the requests
+	// behind this topic", because the Logs page cannot show that set: a
+	// topic's name linked to one request says nine and opens one.
+	encoded, err := sonic.MarshalString(out)
+	require.NoError(t, err)
+	require.Contains(t, encoded, `"example_links":["`+logDetailLink("log-1")+`","`+logDetailLink("log-2")+`"]`)
+	require.NotContains(t, encoded, "sample_links")
+	_, hasLogsLink := out["logs_link"]
+	require.False(t, hasLogsLink, "the unfiltered Logs page is not what a topic count covers")
+	require.Contains(t, out["links"], "one example request")
+	require.Contains(t, out["counts"], "count requests")
+	require.Contains(t, out["cannot_answer"], "a different time range")
+}
+
+func TestWarpListTopicsToolHintsWhenNothingComputed(t *testing.T) {
+	reader := NewTopicReader(&recordingStore{row: validWarpConfigRow()}, topicTestLogStore(t))
+	result, err := runTool(t, "list_topics", &ToolDeps{logManager: &fakeLogReader{}, topics: reader}, map[string]any{})
+	require.NoError(t, err)
+	out := result.(map[string]any)
+	require.Empty(t, out["topics"])
+	require.Contains(t, out["hint"], "No topic clusters have been computed")
+}
+
+// The list is the active topics of the embedding model Warp is configured
+// with, and the count is of the requests filed under those or under none.
+// A topic from another model means nothing against today's vectors, and a
+// retired one is no longer the answer; neither is listed, and the requests
+// filed under them are not counted.
+func TestWarpListTopicsReadsOnlyTheCurrentActiveTopics(t *testing.T) {
+	store := topicTestLogStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	require.NoError(t, store.UpsertWarpTopics(ctx, []logstore.WarpTopic{
+		{ID: "current", Label: "Refund requests", EmbeddingSignature: topicTestSignature()},
+		{ID: "other-model", Label: "Refunds, as another model saw them", EmbeddingSignature: "another model"},
+		{ID: "retired", Label: "Old", EmbeddingSignature: topicTestSignature(), Status: logstore.WarpTopicStatusRetired},
+		{ID: "theme", Label: "Money", Kind: logstore.WarpTopicKindTheme, EmbeddingSignature: topicTestSignature()},
+	}))
+	var rows []logstore.WarpTopicAssignment
+	file := func(topic string, count int) {
+		for index := range count {
+			rows = append(rows, logstore.WarpTopicAssignment{LogID: fmt.Sprintf("%s-%d", topic, index), TopicID: topic, Timestamp: now})
+		}
+	}
+	file("current", 4)
+	file("other-model", 2)
+	file("retired", 3)
+	file("", 1)
+	require.NoError(t, store.UpsertWarpTopicAssignments(ctx, rows))
+
+	topics, total, err := NewTopicReader(&recordingStore{row: validWarpConfigRow()}, store).ListTopics(ctx, 15)
+	require.NoError(t, err)
+	require.Len(t, topics, 1)
+	require.Equal(t, "Refund requests", topics[0].Label)
+	require.Equal(t, 4, topics[0].Size)
+	require.Equal(t, 5, total, "the four in the topic and the one in none")
+	require.InDelta(t, 0.8, topics[0].Share, 1e-9)
+}
+
+// The embedded and Pinecone stores keep each namespace's dimension in memory,
+// so after a restart they cannot page a namespace until it has been declared
+// again. Indexing declares the log namespace as a side effect; a process that
+// has indexed nothing since it started has not, and topics must still run
+// there.
+func TestWarpTopicsWorkOnAStoreThatForgetsNamespaces(t *testing.T) {
+	vectors := newFakeWarpVectorStore()
+	service, start := topicTestService(t, vectors, nil, topicTestNaming)
+	vectors.strict = true
+
+	metaJSON, err := service.BuildTopicsJobMeta(context.Background(), start, start.Add(24*time.Hour))
+	require.NoError(t, err)
+	finalJSON, err := service.RunTopicsJob(context.Background(), tables.TableSidekiqJob{ID: "job-1", Metadata: metaJSON}, func(string) error { return nil })
+	require.NoError(t, err)
+	var final BackfillJobMeta
+	require.NoError(t, sonic.Unmarshal([]byte(finalJSON), &final))
+	require.Equal(t, 6, final.Scanned)
+	require.Equal(t, 2, final.Indexed)
+
+	topics, total, err := NewTopicReader(&recordingStore{row: validWarpConfigRow()}, service.topicStore()).ListTopics(context.Background(), 15)
+	require.NoError(t, err)
+	require.Len(t, topics, 2)
+	require.Equal(t, 6, total)
+}
+
+// A restricted caller must not learn what the whole deployment asks about from
+// a tool that cannot scope its answer. list_topics is withheld from them, and
+// the hint sends them to the sample the store does scope.
+func TestWarpListTopicsIsWithheldFromARestrictedCaller(t *testing.T) {
+	store := topicTestLogStore(t)
+	ctx := context.Background()
+	require.NoError(t, store.UpsertWarpTopics(ctx, []logstore.WarpTopic{{ID: "t-1", Label: "Refund requests", ExampleLogIDsJSON: `["log-1"]`, EmbeddingSignature: topicTestSignature()}}))
+	require.NoError(t, store.UpsertWarpTopicAssignments(ctx, []logstore.WarpTopicAssignment{{LogID: "log-1", TopicID: "t-1", Timestamp: time.Now().UTC()}}))
+	deps := &ToolDeps{logManager: &fakeLogReader{}, topics: NewTopicReader(&recordingStore{row: validWarpConfigRow()}, store)}
+	tool, ok := toolByName(buildTools(), "list_topics")
+	require.True(t, ok)
+
+	for name, ctx := range map[string]context.Context{
+		"row scope":       queryscope.WithQueryScope(context.Background(), func(db *gorm.DB) *gorm.DB { return db }),
+		"dimension scope": queryscope.WithDimensionScope(context.Background(), func(string) ([]string, bool) { return nil, true }),
+	} {
+		result, err := tool.execute(ctx, deps, map[string]any{})
+		require.NoError(t, err, name)
+		out := result.(map[string]any)
+		encoded, err := sonic.MarshalString(out)
+		require.NoError(t, err)
+		require.NotContains(t, encoded, "Refund requests", name)
+		require.NotContains(t, encoded, "log-1", name)
+		require.Equal(t, false, out["available"], name)
+		require.Contains(t, out["hint"], "take one bounded sample", name)
+	}
+
+	result, err := tool.execute(context.Background(), deps, map[string]any{})
+	require.NoError(t, err)
+	require.Len(t, result.(map[string]any)["topics"], 1, "a caller nothing restricts gets the topics")
+}
+
+// Two clusters that come back with the same name are one topic to anyone
+// reading the list, however far apart their centres are. On real traffic the
+// same name turned up on clusters between 0.70 and 0.93 alike, while clusters
+// that were plainly different sat at 0.94 - so no similarity threshold could
+// have joined the first without joining the second. The name can.
+func TestWarpTopicsJobJoinsClustersGivenTheSameName(t *testing.T) {
+	// Every cluster is given the same name, whatever it holds.
+	service, start := topicTestService(t, newFakeWarpVectorStore(), nil, topicTestChat("  refund Requests "))
+	store := service.topicStore()
+	ctx := context.Background()
+	metaJSON, err := service.BuildTopicsJobMeta(ctx, start, start.Add(24*time.Hour))
+	require.NoError(t, err)
+	finalJSON, err := service.RunTopicsJob(ctx, tables.TableSidekiqJob{ID: "job-1", Metadata: metaJSON}, func(string) error { return nil })
+	require.NoError(t, err)
+
+	topics, err := store.ListWarpTopics(ctx, logstore.WarpTopicFilter{Statuses: []string{logstore.WarpTopicStatusActive}})
+	require.NoError(t, err)
+	require.Len(t, topics, 1)
+	require.Equal(t, "refund Requests", topics[0].Label)
+	require.Len(t, topics[0].ExampleLogIDs(), topicsLabelSamples)
+	centroid, err := logstore.DecodeWarpVector(topics[0].Centroid)
+	require.NoError(t, err)
+	require.InDelta(t, 1, float64(dot(centroid, centroid)), 1e-5, "the centre is recomputed from every member")
+	usage, err := store.SummarizeWarpTopicAssignments(ctx, logstore.WarpTopicAssignmentFilter{TopicIDs: []string{topics[0].ID}})
+	require.NoError(t, err)
+	require.Len(t, usage, 1)
+	require.EqualValues(t, 6, usage[0].Requests, "the joined topic holds both clusters' requests")
+
+	var final BackfillJobMeta
+	require.NoError(t, sonic.Unmarshal([]byte(finalJSON), &final))
+	require.Equal(t, 1, final.Indexed)
+	require.Equal(t, 1, final.MergedByName)
+	require.Len(t, final.Topics, 1)
+	require.Equal(t, 6, final.Topics[0].Size)
+	require.Less(t, final.Topics[0].Cohesion, 0.9, "two subjects under one name are looser than either alone, and say so")
+	require.Contains(t, final.Message, "1 more joined for sharing a name")
+}
+
+// TestWarpTopicsJobAgainstLiveVectorStores runs the whole job - read, cluster,
+// name, write, replace, list - with each vector backend Bifrost supports
+// behind it.
+//
+// The fake store cannot stand in for this. Returning vectors was one of three
+// things the job needed from a backend: it also has to page past the first
+// page and hand properties back in a form the job can read (Redis returns
+// every one as text). Each of those passed the unit tests and failed on a
+// real store.
+//
+// It needs the services of tests/docker-compose.yml, so it runs only when
+// WARP_LIVE_VECTORSTORES is set. Hosts follow the vectorstore tests' variables.
+func TestWarpTopicsJobAgainstLiveVectorStores(t *testing.T) {
+	if os.Getenv("WARP_LIVE_VECTORSTORES") == "" {
+		t.Skip("set WARP_LIVE_VECTORSTORES=1 with the vector stores running to run this")
+	}
+	env := func(key, fallback string) string {
+		if value := os.Getenv(key); value != "" {
+			return value
+		}
+		return fallback
+	}
+	logger := bifrost.NewDefaultLogger(schemas.LogLevelError)
+	sv := func(v string) *schemas.SecretVar { return schemas.NewSecretVar(v) }
+	configs := map[string]*vectorstore.Config{
+		"chromem":  {Enabled: true, Type: vectorstore.VectorStoreTypeChromem, Config: vectorstore.ChromemConfig{}},
+		"weaviate": {Enabled: true, Type: vectorstore.VectorStoreTypeWeaviate, Config: vectorstore.WeaviateConfig{Scheme: "http", Host: sv(env("WEAVIATE_HOST", "localhost:9000"))}},
+		"qdrant":   {Enabled: true, Type: vectorstore.VectorStoreTypeQdrant, Config: vectorstore.QdrantConfig{Host: *sv(env("QDRANT_HOST", "localhost")), Port: *sv(env("QDRANT_PORT", "6334"))}},
+		"redis":    {Enabled: true, Type: vectorstore.VectorStoreTypeRedis, Config: vectorstore.RedisConfig{Addr: sv(env("REDIS_ADDR", "localhost:6379"))}},
+		"pinecone": {Enabled: true, Type: vectorstore.VectorStoreTypePinecone, Config: vectorstore.PineconeConfig{APIKey: *sv(env("PINECONE_API_KEY", "pclocal")), IndexHost: *sv(env("PINECONE_INDEX_HOST", "localhost:5081"))}},
+	}
+	for _, name := range []string{"chromem", "weaviate", "qdrant", "redis", "pinecone"} {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			defer cancel()
+			store, err := vectorstore.NewVectorStore(ctx, configs[name], logger)
+			require.NoError(t, err)
+			namespace := fmt.Sprintf("WarpLive%d", time.Now().UnixNano()%1000000)
+			row := validWarpConfigRow()
+			row.LogVectorStoreNamespace = namespace
+			config := configFromRow(row)
+			t.Cleanup(func() { _ = store.DeleteNamespace(context.Background(), namespace) })
+			_, err = ensureWarpNamespace(ctx, store, namespace, config.EmbeddingDimension)
+			require.NoError(t, err)
+
+			start := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+			rng := rand.New(rand.NewSource(1))
+			logs := map[string]logstore.Log{}
+			const perSubject = 130 // two pages of 200 between them, so paging is exercised
+			for subject, question := range []string{"how do I get a refund", "reset my password please"} {
+				for n := range perSubject {
+					id := uuid.NewString()
+					vector := make([]float32, config.EmbeddingDimension)
+					for d := range vector {
+						vector[d] = float32(rng.NormFloat64() * 0.01)
+					}
+					vector[subject] = 1
+					at := start.Add(time.Duration(n) * time.Minute)
+					logs[id] = logstore.Log{ID: id, Timestamp: at, Object: string(schemas.ChatCompletionRequest), Status: "success", ContentSummary: question}
+					require.NoError(t, store.Add(ctx, namespace, id, unitVector(vector), map[string]interface{}{
+						"log_id": id, "timestamp": at.Unix(), "warp_log": true, "status": "success", "object": "chat_completion",
+						"provider": "openai", "model": "gpt-4o", "team_ids": []string{}, "customer_ids": []string{}, "business_unit_ids": []string{},
+					}))
+				}
+			}
+			time.Sleep(2 * time.Second)
+
+			reader := topicTestReader(t, logs)
+			service := NewService(nil,
+				WithConfigStore(&recordingStore{row: row}), WithLogReader(reader),
+				WithVectorStore(store), WithEmbeddingExecutor(backfillEmbeddingExecutor), WithChatFunc(topicTestNaming),
+			)
+			defer service.Shutdown()
+			topicReader := NewTopicReader(&recordingStore{row: row}, reader.topics)
+
+			for run := 1; run <= 2; run++ {
+				metaJSON, err := service.BuildTopicsJobMeta(ctx, start, start.Add(24*time.Hour))
+				require.NoError(t, err)
+				finalJSON, err := service.RunTopicsJob(ctx, tables.TableSidekiqJob{ID: uuid.NewString(), Metadata: metaJSON}, func(string) error { return nil })
+				require.NoError(t, err, "run %d", run)
+				var final BackfillJobMeta
+				require.NoError(t, sonic.Unmarshal([]byte(finalJSON), &final))
+				require.Equal(t, 2*perSubject, final.Scanned, "run %d reads every vector", run)
+				require.Equal(t, 2, final.Indexed, "run %d", run)
+				require.Empty(t, final.LastError, "run %d", run)
+
+				topics, total, err := topicReader.ListTopics(ctx, 15)
+				require.NoError(t, err, "run %d", run)
+				require.Equal(t, 2*perSubject, total)
+				require.Len(t, topics, 2, "run %d leaves only its own topics", run)
+				for _, topic := range topics {
+					require.GreaterOrEqual(t, topic.Size, perSubject-5)
+					require.Len(t, topic.SampleLogIDs, topicsLabelSamples)
+					require.Greater(t, topic.Cohesion, 0.5)
+				}
+			}
+		})
+	}
 }
