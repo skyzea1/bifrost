@@ -246,6 +246,98 @@ func TestWarpUpkeepRetiresSilentTopics(t *testing.T) {
 	require.Equal(t, TopicUpkeep{}, done, "a second pass finds nothing to do")
 }
 
+// Upkeep tidies what nothing reads: a pooled request embedded by another
+// model is dropped, a merged topic whose survivor was retired is retired too,
+// and a row retired for longer than the grace period is deleted - but not
+// before, so a reader in flight still finds the row an id names.
+func TestWarpUpkeepPrunesWhatNothingReads(t *testing.T) {
+	service, reader := discoveryTestService(t, topicTestNaming)
+	store := reader.topics
+	ctx := context.Background()
+	signature := embeddingConfigSignature(configFromRow(assignTestRow()))
+	now := time.Now().UTC()
+	old := now.Add(-2 * topicsRetireAfter)
+	require.NoError(t, store.UpsertWarpTopics(ctx, []logstore.WarpTopic{
+		{ID: "busy", Label: "Busy", Centroid: logstore.EncodeWarpVector([]float32{1, 0, 0}), EmbeddingSignature: signature, CreatedAt: old},
+		{ID: "silent", Label: "Silent", Centroid: logstore.EncodeWarpVector([]float32{0, 1, 0}), EmbeddingSignature: signature, CreatedAt: old},
+		{ID: "into-silent", Label: "Also silent", Centroid: logstore.EncodeWarpVector([]float32{0, 1, 0}), EmbeddingSignature: signature, Status: logstore.WarpTopicStatusMerged, MergedInto: "silent"},
+		{ID: "into-busy", Label: "Busy too", Centroid: logstore.EncodeWarpVector([]float32{1, 0, 0}), EmbeddingSignature: signature, Status: logstore.WarpTopicStatusMerged, MergedInto: "busy"},
+		{ID: "long-gone", Label: "Long gone", Centroid: logstore.EncodeWarpVector([]float32{0, 0, 1}), EmbeddingSignature: signature, Status: logstore.WarpTopicStatusRetired},
+	}))
+	require.NoError(t, store.UpsertWarpTopicAssignments(ctx, []logstore.WarpTopicAssignment{
+		{LogID: "busy-now", TopicID: "busy", Timestamp: now.Add(-time.Hour)},
+		{LogID: "silent-then", TopicID: "silent", Timestamp: old},
+	}))
+	require.NoError(t, store.AddWarpTopicUnmatched(ctx, []logstore.WarpTopicUnmatched{
+		{LogID: "old-model", Timestamp: now, LogCreatedAt: now, Vector: logstore.EncodeWarpVector([]float32{1, 0, 0}), EmbeddingSignature: "another model"},
+		{LogID: "this-model", Timestamp: now, LogCreatedAt: now, Vector: logstore.EncodeWarpVector([]float32{1, 0, 0}), EmbeddingSignature: signature},
+	}))
+
+	// Within the grace period nothing retired is deleted yet.
+	done, err := service.MaintainTopics(ctx)
+	require.NoError(t, err)
+	require.Equal(t, TopicUpkeep{Retired: 1, Dropped: 1}, done)
+	rows := topicsByID(t, store, logstore.WarpTopicKindTopic)
+	require.Len(t, rows, 5, "retired rows are kept for the grace period")
+	require.Equal(t, logstore.WarpTopicStatusRetired, rows["silent"].Status)
+	require.Equal(t, logstore.WarpTopicStatusRetired, rows["into-silent"].Status, "merged into a retired topic, so retired too")
+	require.Equal(t, logstore.WarpTopicStatusMerged, rows["into-busy"].Status, "its survivor is still active")
+	pooled, err := store.ListWarpTopicUnmatched(ctx, signature, 10)
+	require.NoError(t, err)
+	require.Len(t, pooled, 1, "the other model's request was dropped")
+	gone, err := store.CountWarpTopicUnmatched(ctx, "another model")
+	require.NoError(t, err)
+	require.Zero(t, gone)
+
+	// Past it, they go; what is still read stays.
+	service.topicLimits.pruneGrace = time.Nanosecond
+	time.Sleep(2 * time.Millisecond)
+	done, err = service.MaintainTopics(ctx)
+	require.NoError(t, err)
+	require.Equal(t, TopicUpkeep{Pruned: 3}, done, "silent, into-silent and long-gone")
+	rows = topicsByID(t, store, logstore.WarpTopicKindTopic)
+	require.Len(t, rows, 2)
+	require.Contains(t, rows, "busy")
+	require.Contains(t, rows, "into-busy")
+}
+
+// Topic health is what the settings card and the index status show: how
+// many topics and themes there are to file under, how many requests wait in
+// the pool, and how much of the last day matched nothing.
+func TestWarpTopicHealthReadsLiveFiling(t *testing.T) {
+	service, reader := discoveryTestService(t, topicTestNaming)
+	store := reader.topics
+	ctx := context.Background()
+	signature := embeddingConfigSignature(configFromRow(assignTestRow()))
+	now := time.Now().UTC()
+
+	health, err := service.TopicHealth(ctx)
+	require.NoError(t, err)
+	require.Equal(t, TopicHealth{}, health, "nothing built, nothing filed")
+
+	require.NoError(t, store.UpsertWarpTopics(ctx, []logstore.WarpTopic{
+		{ID: "money", Label: "Money", Kind: logstore.WarpTopicKindTheme, EmbeddingSignature: signature},
+		{ID: "refunds", Label: "Refunds", ParentID: "money", EmbeddingSignature: signature},
+		{ID: "passwords", Label: "Passwords", EmbeddingSignature: signature},
+		{ID: "retired", Label: "Retired", EmbeddingSignature: signature, Status: logstore.WarpTopicStatusRetired},
+		{ID: "other-model", Label: "Other", EmbeddingSignature: "another model"},
+	}))
+	require.NoError(t, store.UpsertWarpTopicAssignments(ctx, []logstore.WarpTopicAssignment{
+		{LogID: "r-1", TopicID: "refunds", Timestamp: now.Add(-time.Hour)},
+		{LogID: "r-2", TopicID: "refunds", Timestamp: now.Add(-2 * time.Hour)},
+		{LogID: "p-1", TopicID: "passwords", Timestamp: now.Add(-time.Hour)},
+		{LogID: "n-1", TopicID: "", Timestamp: now.Add(-time.Hour)},
+		{LogID: "n-old", TopicID: "", Timestamp: now.Add(-48 * time.Hour)},
+	}))
+	require.NoError(t, store.AddWarpTopicUnmatched(ctx, []logstore.WarpTopicUnmatched{
+		{LogID: "n-1", Timestamp: now, LogCreatedAt: now, Vector: logstore.EncodeWarpVector([]float32{1, 0, 0}), EmbeddingSignature: signature},
+		{LogID: "n-other", Timestamp: now, LogCreatedAt: now, Vector: logstore.EncodeWarpVector([]float32{1, 0, 0}), EmbeddingSignature: "another model"},
+	}))
+	health, err = service.TopicHealth(ctx)
+	require.NoError(t, err)
+	require.Equal(t, TopicHealth{ActiveTopics: 2, Themes: 1, Pooled: 1, RequestsDay: 4, UnmatchedDay: 1, UnmatchedShare: 0.25}, health)
+}
+
 // A pass that changes the topics regroups them into themes; one that changes
 // nothing leaves the themes alone.
 func TestWarpUpkeepRegroupsThemesWhenTopicsChange(t *testing.T) {
