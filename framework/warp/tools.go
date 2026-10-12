@@ -246,6 +246,12 @@ func (e *unknownFilterFieldsError) Error() string {
 // is the worst failure mode available here: the model cannot tell, and neither
 // can the reader.
 func parseFilters(raw map[string]any, now time.Time) (*logstore.SearchFilters, error) {
+	return parseFiltersWithLookback(raw, now, DefaultLookback)
+}
+
+// parseFiltersWithLookback is parseFilters with the window a missing
+// start_time falls back to, measured back from end_time.
+func parseFiltersWithLookback(raw map[string]any, now time.Time, lookback time.Duration) (*logstore.SearchFilters, error) {
 	filters := &logstore.SearchFilters{}
 	if raw == nil {
 		raw = map[string]any{}
@@ -299,7 +305,7 @@ func parseFilters(raw map[string]any, now time.Time) (*logstore.SearchFilters, e
 		end = &now
 	}
 	if start == nil {
-		defaulted := end.Add(-DefaultLookback)
+		defaulted := end.Add(-lookback)
 		start = &defaulted
 	}
 	if start.After(*end) {
