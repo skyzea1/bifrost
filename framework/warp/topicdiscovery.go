@@ -238,6 +238,13 @@ func (s *Service) RunDiscoveryJob(ctx context.Context, job tables.TableSidekiqJo
 	if s.indexer != nil {
 		s.indexer.InvalidateTopics()
 	}
+	if len(created) > 0 {
+		if themes, err := s.GroupTopics(ctx); err != nil {
+			meta.LastError = fmt.Sprintf("group topics into themes: %v", err)
+		} else {
+			meta.Themes = themes.Themes
+		}
+	}
 	meta.Message = fmt.Sprintf("Clustered %d pooled request(s): %d new topic(s), %d cluster(s) folded into existing topics, %d request(s) filed.", len(pool), meta.Indexed, meta.Merged, filed)
 	if meta.Unassigned > 0 {
 		meta.Message += fmt.Sprintf(" %d stay pooled for next time.", meta.Unassigned)
@@ -358,6 +365,9 @@ func fileTopicMembers(ctx context.Context, store logstore.WarpTopicStore, topic 
 type TopicUpkeep struct {
 	Retired int
 	Merged  int
+	// Themes is how many themes the topics are grouped into after a pass
+	// that changed them; zero when nothing changed.
+	Themes int
 }
 
 // MaintainTopics retires the topics whose traffic has stopped and merges the
@@ -446,8 +456,17 @@ func (s *Service) MaintainTopics(ctx context.Context) (TopicUpkeep, error) {
 	if err := store.UpsertWarpTopics(ctx, changed); err != nil {
 		return done, fmt.Errorf("write topics: %w", err)
 	}
-	if s.indexer != nil && (done.Retired > 0 || done.Merged > 0) {
-		s.indexer.InvalidateTopics()
+	if done.Retired > 0 || done.Merged > 0 {
+		if s.indexer != nil {
+			s.indexer.InvalidateTopics()
+		}
+		// The themes follow the topics. A model that cannot group them
+		// leaves the themes as they were, tidied; upkeep has done its job.
+		themes, err := s.GroupTopics(ctx)
+		if err != nil {
+			s.warnf("warp: group topics into themes: %v", err)
+		}
+		done.Themes = themes.Themes
 	}
 	return done, nil
 }
