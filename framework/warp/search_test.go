@@ -240,6 +240,42 @@ func TestWarpSemanticRefillsCandidatesPastFilteredRows(t *testing.T) {
 // the rows this one silently dropped. Both ends normalize to lower case:
 // buildLogIndexItem stores the scalar fields lowered, and the filter values
 // are lowered to meet them.
+// A session filter used to reach semantic search and do nothing: the vector
+// prefilter had no field for it and the post-filter never looked, so "what
+// was asked in this session" came back with every session's rows. The
+// session is on the vector now, and both halves honour it.
+func TestWarpSemanticFiltersNarrowToASession(t *testing.T) {
+	queries := semanticVectorFilters(&logstore.SearchFilters{SessionID: "Sess-1"})
+	fields := map[string]vectorstore.Query{}
+	for _, query := range queries {
+		fields[query.Field] = query
+	}
+	session, ok := fields["session_id"]
+	require.True(t, ok, "the session must reach the vector store")
+	require.Equal(t, vectorstore.QueryOperatorEqual, session.Operator)
+	require.Equal(t, "sess-1", session.Value, "lowered to meet the index")
+	_, ok = semanticVectorFilterFields(semanticVectorFilters(&logstore.SearchFilters{}))["session_id"]
+	require.False(t, ok, "no session named, no predicate")
+
+	mine, theirs := "sess-1", "sess-2"
+	inSession := &logstore.Log{Provider: "openai", SessionID: &mine}
+	another := &logstore.Log{Provider: "openai", SessionID: &theirs}
+	none := &logstore.Log{Provider: "openai"}
+	filters := &logstore.SearchFilters{SessionID: "Sess-1"}
+	require.True(t, matchesSemanticFilters(inSession, filters))
+	require.False(t, matchesSemanticFilters(another, filters))
+	require.False(t, matchesSemanticFilters(none, filters), "a request in no session is not in this one")
+	require.True(t, matchesSemanticFilters(none, &logstore.SearchFilters{}))
+}
+
+func semanticVectorFilterFields(queries []vectorstore.Query) map[string]vectorstore.Query {
+	fields := map[string]vectorstore.Query{}
+	for _, query := range queries {
+		fields[query.Field] = query
+	}
+	return fields
+}
+
 func TestWarpSemanticScalarFiltersAreCaseInsensitive(t *testing.T) {
 	queries := semanticVectorFilters(&logstore.SearchFilters{
 		Providers: []string{"OpenAI"},
