@@ -510,6 +510,11 @@ func (s *Service) RunTopicsJob(ctx context.Context, job tables.TableSidekiqJob, 
 		// this is reported rather than failing a run that did its job.
 		meta.LastError = fmt.Sprintf("retire previous topics: %v", err)
 	}
+	// Requests indexed from now on are filed under the new topics at once in
+	// this process; other instances pick them up when their copy expires.
+	if s.indexer != nil {
+		s.indexer.InvalidateTopics()
+	}
 	meta.Message = fmt.Sprintf("Clustered %d request(s) into %d topic(s).", meta.Clustered, meta.Indexed)
 	if meta.Assigned > 0 {
 		meta.Message += fmt.Sprintf(" %d more were given to the nearest topic.", meta.Assigned)
