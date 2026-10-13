@@ -4,9 +4,13 @@
 
 Official Helm charts for deploying [Bifrost](https://github.com/maximhq/bifrost) - a high-performance AI gateway with unified interface for multiple providers.
 
-**Latest Version:** 2.1.44
+**Latest Version:** 2.1.45
 
 ## Changelog
+
+### Upcoming
+
+- Added `nodeSelector`, `tolerations` and `affinity` to the chart-managed Redis (`vectorStore.redis.master.*`), Qdrant (`vectorStore.qdrant.*`) and Weaviate (`vectorStore.weaviate.*`) deployments, matching `postgresql.primary.*`. Lets these stateful pods be pinned to dedicated or non-spot nodes. Defaults are empty and render nothing. Pod-spec only, no config.json change. Closes #3440.
 
 ### 2.1.44
 

@@ -1,0 +1,12 @@
+---
+title: "v2.1.45"
+description: "Helm v2.1.45 changelog - 2026-10-13"
+---
+
+<Update label="Bifrost Helm" description="v2.1.45">
+
+## Changelog
+
+- Added `nodeSelector`, `tolerations` and `affinity` to the chart-managed Redis (`vectorStore.redis.master.*`), Qdrant (`vectorStore.qdrant.*`) and Weaviate (`vectorStore.weaviate.*`) deployments, matching `postgresql.primary.*`. Lets these stateful pods be pinned to dedicated or non-spot nodes. Defaults are empty and render nothing. Pod-spec only, no config.json change. Closes #3440.
+
+</Update>
